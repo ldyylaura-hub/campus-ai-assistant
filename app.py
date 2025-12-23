@@ -508,13 +508,27 @@ def main_app():
                 with st.chat_message("assistant"):
                     message_placeholder = st.empty()
                     try:
+                        # 调试信息：检查关键对象
+                        print(f"DEBUG: Model Name: {model_name}")
+                        print(f"DEBUG: Base URL: {base_url}")
+                        
+                        # 修正 base_url: 如果为空字符串，设为 None，避免 httpx 报错
+                        final_base_url = base_url.strip() if base_url and base_url.strip() else None
+
                         llm = ChatOpenAI(
                             model=model_name, 
                             temperature=0, 
                             api_key=api_key,
-                            base_url=base_url
+                            base_url=final_base_url
                         )
+                        print(f"DEBUG: LLM created: {type(llm)}")
+
+                        if not st.session_state.vector_store:
+                            raise ValueError("Vector Store is None")
+
                         retriever = st.session_state.vector_store.as_retriever()
+                        print(f"DEBUG: Retriever created: {type(retriever)}")
+
                         system_prompt = (
                             "你是一个乐于助人的校园助手。请根据下面的上下文（Context）回答用户的问题。"
                             "如果上下文中没有答案，请诚实地说你不知道。\n\nContext: {context}"
@@ -523,8 +537,12 @@ def main_app():
                             ("system", system_prompt),
                             ("human", "{input}"),
                         ])
+                        
                         question_answer_chain = create_stuff_documents_chain(llm, prompt_template)
+                        print(f"DEBUG: QA Chain created: {type(question_answer_chain)}")
+                        
                         rag_chain = create_retrieval_chain(retriever, question_answer_chain)
+                        print(f"DEBUG: RAG Chain created: {type(rag_chain)}")
                         
                         response = rag_chain.invoke({"input": prompt})
                         answer = response["answer"]
@@ -533,8 +551,19 @@ def main_app():
                         st.session_state.messages.append({"role": "assistant", "content": answer})
                         
                     except Exception as e:
+                        # 打印完整堆栈信息到控制台
+                        import traceback
+                        traceback.print_exc()
+                        
                         error_msg = handle_api_error(e)
                         message_placeholder.error(error_msg)
+                        
+                        # 在 UI 上显示详细错误以便调试
+                        with st.expander("🔍 调试信息 (开发者可见)"):
+                            st.write(f"Error Type: {type(e)}")
+                            st.write(f"Error Details: {str(e)}")
+                            st.code(traceback.format_exc())
+                            
                         st.session_state.messages.append({"role": "assistant", "content": error_msg})
 
     # === Tab 2: 创意配图 ===

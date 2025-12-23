@@ -1,6 +1,17 @@
 import streamlit as st
 import os
 import warnings
+
+# --- 针对 Streamlit Cloud 的 SQLite 补丁 (解决 ChromaDB 部署报错) ---
+# 必须在引入 chromadb 或 langchain 之前运行
+try:
+    __import__('pysqlite3')
+    import sys
+    sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
+except ImportError:
+    pass
+# ---------------------------------------------------------------
+
 import oss2 # 引入 OSS SDK
 
 # 💡 关键修复：必须在引入任何 HuggingFace 相关库之前设置镜像环境变量

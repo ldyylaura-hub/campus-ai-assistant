@@ -42,8 +42,10 @@ from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings # 引入本地 Embeddings
 from langchain.chains import create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
+# from langchain.chains.combine_documents import create_stuff_documents_chain # 暂时移除以解决 Streamlit Cloud 报错
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
 from dotenv import load_dotenv
 from openai import OpenAI # 引入 OpenAIError 基类
 # from BingImageCreator import ImageGen # 原版引入
@@ -538,7 +540,19 @@ def main_app():
                             ("human", "{input}"),
                         ])
                         
-                        question_answer_chain = create_stuff_documents_chain(llm, prompt_template)
+                        # --- 手动构建 RAG 链 (替代 create_stuff_documents_chain) ---
+                        # 解决 create_stuff_documents_chain 在 Streamlit Cloud 上可能出现的 TypeError
+                        def format_docs(docs):
+                            return "\n\n".join(doc.page_content for doc in docs)
+
+                        # 这个链接收 {"context": [docs], "input": "query"}
+                        # 并将其转换为 Prompt 需要的 {"context": "doc_str", "input": "query"}
+                        question_answer_chain = (
+                            RunnablePassthrough.assign(context=lambda x: format_docs(x["context"]))
+                            | prompt_template
+                            | llm
+                            | StrOutputParser()
+                        )
                         print(f"DEBUG: QA Chain created: {type(question_answer_chain)}")
                         
                         rag_chain = create_retrieval_chain(retriever, question_answer_chain)

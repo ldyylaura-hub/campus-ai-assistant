@@ -44,7 +44,7 @@ from langchain_community.embeddings import HuggingFaceEmbeddings # 引入本地 
 from langchain.chains import create_retrieval_chain
 # from langchain.chains.combine_documents import create_stuff_documents_chain # 暂时移除以解决 Streamlit Cloud 报错
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain_core.output_parsers import StrOutputParser
 from dotenv import load_dotenv
 from openai import OpenAI # 引入 OpenAIError 基类
@@ -193,6 +193,7 @@ def main_app():
     # --- 侧边栏：配置与上传 ---
     with st.sidebar:
         st.header("⚙️ 设置")
+        debug_mode = st.checkbox("开发者调试模式", value=False, key="input_debug_mode")
         
         # 获取默认值 (从 session_state.user_config 中取，如果没有则用默认值)
         cfg = st.session_state.user_config
@@ -334,20 +335,14 @@ def main_app():
         # 测试 Bing 连接按钮 (仅当选择了 Bing 时显示)
         if image_provider == "Bing Image Creator (免费)":
             if st.button("🧪 测试 Bing 连接 (检查 Cookie)"):
-                # 构造临时 ImageGen 对象进行测试
                 try:
-                    # 智能解析逻辑 (复用)
                     final_u = bing_cookie
                     final_srch = bing_cookie_srch
                     all_cookies_list = []
-                    
                     if full_cookie_str:
-                        # Clean input
                         full_cookie_str = full_cookie_str.strip()
                         if full_cookie_str.lower().startswith("cookie:"):
                             full_cookie_str = full_cookie_str[7:].strip()
-                            
-                        # 尝试解析 JSON
                         if full_cookie_str.startswith('[') and full_cookie_str.endswith(']'):
                             import json
                             json_cookies = json.loads(full_cookie_str)
@@ -359,7 +354,6 @@ def main_app():
                                     elif item['name'] == "SRCHHPGUSR":
                                         final_srch = item['value']
                         else:
-                            # key=value
                             for item in full_cookie_str.split(';'):
                                 if '=' in item:
                                     k, v = item.strip().split('=', 1)
@@ -368,30 +362,25 @@ def main_app():
                                         final_u = v
                                     elif k.strip() == "SRCHHPGUSR":
                                         final_srch = v
-                    
                     if not final_u:
-                         st.error("❌ 无法找到 _U Cookie，请先填写配置！")
+                        st.error("❌ 无法找到 _U Cookie，请先填写配置！")
                     else:
-                        if not final_srch: final_srch = final_u
-                        
+                        if not final_srch:
+                            final_srch = final_u
                         test_gen = ImageGen(
-                            auth_cookie=final_u, 
-                            auth_cookie_SRCHHPGUSR=final_srch, 
+                            auth_cookie=final_u,
+                            auth_cookie_SRCHHPGUSR=final_srch,
                             all_cookies=all_cookies_list,
-                            quiet=False,
+                            quiet=(not debug_mode),
                             user_agent=user_agent
                         )
-                        
-                        # 设置代理
                         if proxy_url:
                             test_gen.session.proxies = {"http": proxy_url, "https": proxy_url}
-                            
                         with st.spinner("正在验证 Bing 连接..."):
                             if test_gen.validate_session():
                                 st.success("✅ Bing 连接成功！Cookie 有效，且未检测到登录跳转。")
                             else:
                                 st.error("❌ Bing 连接验证失败：Cookie 可能失效，或 IP 被重定向到登录页。请检查日志。")
-                                
                 except Exception as e:
                     st.error(f"测试出错: {e}")
 
@@ -464,11 +453,21 @@ def main_app():
                         # 这里我们改用内存模式 (不传 persist_directory) 或者每个用户独立目录
                         user_db_dir = f"./chroma_db_{st.session_state.user_id}"
                         
+                        # 为避免再次上传仍读取旧文件，这里在“开始处理文档”时清空用户目录
+                        try:
+                            if os.path.exists(user_db_dir):
+                                import shutil
+                                shutil.rmtree(user_db_dir, ignore_errors=True)
+                                print(f"DEBUG: Cleared old vector store directory: {user_db_dir}")
+                        except Exception as _e:
+                            print(f"DEBUG: Failed to clear old vector store: {_e}")
+                        
+                        st.session_state.vector_store = None
                         vector_store = Chroma.from_documents(
                             documents=splits, 
-                            embedding=embeddings,
-                            persist_directory=user_db_dir 
+                            embedding=embeddings
                         )
+                        print(f"DEBUG: New in-memory vector store built from {len(splits)} chunks")
                         
                         st.session_state.vector_store = vector_store
                         st.success(f"成功处理 {len(splits)} 个文本片段！现在可以提问或生成配图了。")
@@ -510,12 +509,31 @@ def main_app():
                 with st.chat_message("assistant"):
                     message_placeholder = st.empty()
                     try:
+                        def log_debug(msg):
+                            if debug_mode:
+                                print(msg)
                         # 调试信息：检查关键对象
-                        print(f"DEBUG: Model Name: {model_name}")
-                        print(f"DEBUG: Base URL: {base_url}")
+                        log_debug(f"DEBUG: Model Name: {model_name}")
+                        log_debug(f"DEBUG: Base URL: {base_url}")
                         
-                        # 修正 base_url: 如果为空字符串，设为 None，避免 httpx 报错
-                        final_base_url = base_url.strip() if base_url and base_url.strip() else None
+                        # 修正 base_url：去除空格/反引号/引号，若为空则设为 None，避免 httpx 报错
+                        def sanitize_base_url(url):
+                            if not url:
+                                return None
+                            cleaned = url.strip().strip("`").strip("\"").strip("'")
+                            if not cleaned:
+                                return None
+                            # Ensure path includes /v1 for OpenAI-compatible providers
+                            try:
+                                from urllib.parse import urlparse
+                                parsed = urlparse(cleaned)
+                                if parsed.path == "" or parsed.path == "/":
+                                    cleaned = cleaned.rstrip("/") + "/v1"
+                            except Exception:
+                                pass
+                            return cleaned
+                        final_base_url = sanitize_base_url(base_url)
+                        log_debug(f"DEBUG: Final Base URL: {final_base_url}")
 
                         llm = ChatOpenAI(
                             model=model_name, 
@@ -523,13 +541,13 @@ def main_app():
                             api_key=api_key,
                             base_url=final_base_url
                         )
-                        print(f"DEBUG: LLM created: {type(llm)}")
+                        log_debug(f"DEBUG: LLM created: {type(llm)}")
 
                         if not st.session_state.vector_store:
                             raise ValueError("Vector Store is None")
 
                         retriever = st.session_state.vector_store.as_retriever()
-                        print(f"DEBUG: Retriever created: {type(retriever)}")
+                        log_debug(f"DEBUG: Retriever created: {type(retriever)}")
 
                         system_prompt = (
                             "你是一个乐于助人的校园助手。请根据下面的上下文（Context）回答用户的问题。"
@@ -540,26 +558,24 @@ def main_app():
                             ("human", "{input}"),
                         ])
                         
-                        # --- 手动构建 RAG 链 (替代 create_stuff_documents_chain) ---
-                        # 解决 create_stuff_documents_chain 在 Streamlit Cloud 上可能出现的 TypeError
                         def format_docs(docs):
                             return "\n\n".join(doc.page_content for doc in docs)
-
-                        # 这个链接收 {"context": [docs], "input": "query"}
-                        # 并将其转换为 Prompt 需要的 {"context": "doc_str", "input": "query"}
-                        question_answer_chain = (
-                            RunnablePassthrough.assign(context=lambda x: format_docs(x["context"]))
+                        
+                        format_docs_runnable = RunnableLambda(lambda docs: format_docs(docs))
+                        log_debug(f"DEBUG: format_docs_runnable ready: {format_docs_runnable}")
+                        
+                        chain = (
+                            {
+                                "context": retriever | format_docs_runnable,
+                                "input": RunnablePassthrough()
+                            }
                             | prompt_template
                             | llm
                             | StrOutputParser()
                         )
-                        print(f"DEBUG: QA Chain created: {type(question_answer_chain)}")
+                        log_debug(f"DEBUG: Composed chain: {type(chain)}")
                         
-                        rag_chain = create_retrieval_chain(retriever, question_answer_chain)
-                        print(f"DEBUG: RAG Chain created: {type(rag_chain)}")
-                        
-                        response = rag_chain.invoke({"input": prompt})
-                        answer = response["answer"]
+                        answer = chain.invoke(prompt)
                         
                         message_placeholder.markdown(answer)
                         st.session_state.messages.append({"role": "assistant", "content": answer})
@@ -599,11 +615,28 @@ def main_app():
                     with st.spinner("正在构思画面并绘图 (这可能需要十几秒)..."):
                         try:
                             # 1. 使用 LLM 生成绘画 Prompt
+                            # 清洗 base_url，避免粘贴时带了反引号/引号
+                            def sanitize_base_url(url):
+                                if not url:
+                                    return None
+                                cleaned = url.strip().strip("`").strip("\"").strip("'")
+                                if not cleaned:
+                                    return None
+                                try:
+                                    from urllib.parse import urlparse
+                                    parsed = urlparse(cleaned)
+                                    if parsed.path == "" or parsed.path == "/":
+                                        cleaned = cleaned.rstrip("/") + "/v1"
+                                except Exception:
+                                    pass
+                                return cleaned
+                            final_base_url_img = sanitize_base_url(base_url)
+                            
                             llm = ChatOpenAI(
                                 model=model_name, 
                                 temperature=0.7, 
                                 api_key=api_key,
-                                base_url=base_url
+                                base_url=final_base_url_img
                             )
                             
                             # 简单获取文档摘要（取前2000字符，避免token溢出）
@@ -742,9 +775,11 @@ def main_app():
                                                     print(f"DEBUG: Using Proxy: {proxy_url}")
                                                 
                                                 status.write("正在提交绘画任务...")
-                                                print(f"DEBUG: Submitting prompt to Bing: {image_prompt}")
+                                                if debug_mode:
+                                                    print(f"DEBUG: Submitting prompt to Bing: {image_prompt}")
                                                 image_urls = image_gen.get_images(image_prompt)
-                                                print(f"DEBUG: Received {len(image_urls)} images")
+                                                if debug_mode:
+                                                    print(f"DEBUG: Received {len(image_urls)} images")
                                                 
                                                 status.update(label="绘图成功！", state="complete")
                                                 
